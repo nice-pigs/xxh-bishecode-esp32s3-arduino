@@ -71,6 +71,7 @@ unsigned long last_sensor_read = 0;
 /* ============== 模式控制变量 ============== */
 bool preview_mode = false;
 bool need_redraw_main = true;
+bool camera_in_jpeg_mode = false;  // 摄像头当前是否为JPEG模式
 
 // 状态机
 typedef enum {
@@ -91,6 +92,7 @@ void wifi_connect();
 void capture_and_upload();
 void read_sensors();
 void update_sensor_display();
+void display_multiline_text(uint16_t x, uint16_t y, uint16_t max_width, const char* text, lcd_font_t font, uint16_t color);
 
 /* ============== 传感器读取函数 ============== */
 
@@ -138,7 +140,7 @@ void update_sensor_display()
     char buf[64];
     
     // 清除传感器数据区域
-    lcd_fill(30, 210, 300, 320, BLACK);
+    lcd_fill(30, 210, 300, 320, WHITE);
     
     int y = 210;
     
@@ -221,6 +223,8 @@ void setup()
     config.jpeg_quality = 12;
     config.fb_count = 2;
     
+    camera_in_jpeg_mode = false;  // 初始化为RGB565模式
+    
     // 摄像头上电（如果需要）
     if (OV_PWDN_PIN == -1) {
         xl9555_io_config(OV_PWDN, IO_SET_OUTPUT);
@@ -292,7 +296,7 @@ void setup()
     }
     
     // 主界面
-    lcd_clear(BLACK);
+    lcd_clear(WHITE);
     xl9555_pin_set(SLCD_PWR, IO_SET_HIGH);
     lcd_show_string(30, 20, 200, 24, LCD_FONT_24, "Smart Guide", RED);
     lcd_show_string(30, 55, 200, 16, LCD_FONT_16, "KEY1: Capture", BLUE);
@@ -303,7 +307,7 @@ void setup()
     }
     
     // 显示传感器状态
-    lcd_show_string(30, 145, 200, 16, LCD_FONT_16, "Sensors:", WHITE);
+    lcd_show_string(30, 145, 200, 16, LCD_FONT_16, "Sensors:", BLACK);
     if (dht11_ok) {
         lcd_show_string(30, 165, 200, 16, LCD_FONT_16, "DHT11: OK", GREEN);
     } else {
@@ -391,7 +395,7 @@ void loop()
         case STATE_IDLE:
             // 重绘主界面
             if (need_redraw_main) {
-                lcd_clear(BLACK);
+                lcd_clear(WHITE);
                 xl9555_pin_set(SLCD_PWR, IO_SET_HIGH);
                 lcd_show_string(30, 20, 200, 24, LCD_FONT_24, "Smart Guide", RED);
                 lcd_show_string(30, 55, 200, 16, LCD_FONT_16, "KEY0: Preview", BLUE);
@@ -403,7 +407,7 @@ void loop()
                 }
                 
                 // 显示传感器状态
-                lcd_show_string(30, 145, 200, 16, LCD_FONT_16, "Sensors:", WHITE);
+                lcd_show_string(30, 145, 200, 16, LCD_FONT_16, "Sensors:", BLACK);
                 if (dht11_ok) {
                     lcd_show_string(30, 165, 200, 16, LCD_FONT_16, "DHT11: OK", GREEN);
                 } else {
@@ -425,9 +429,9 @@ void loop()
                 Serial.println(">>> KEY0进入预览");
                 app_state = STATE_PREVIEW;
                 need_redraw_main = true;
-                lcd_clear(BLACK);
+                lcd_clear(WHITE);
             } else if (key1_pressed && wifi_connected) {
-                Serial.println(">>> KEY1拍照识别");
+                Serial.println(">>> KEY1拍照识别（从待机模式）");
                 app_state = STATE_CAPTURING;
                 capture_and_upload();
                 app_state = STATE_IDLE;
@@ -438,11 +442,24 @@ void loop()
         case STATE_PREVIEW:
             // 预览模式
             {
-                camera_fb_t *fb = esp_camera_fb_get();
-                if (fb) {
-                    // RGB565直接显示
-                    lcd_show_pic(0, 0, fb->width, fb->height, (uint8_t *)fb->buf);
-                    esp_camera_fb_return(fb);
+                if (!camera_in_jpeg_mode) {
+                    // RGB565模式：直接显示
+                    camera_fb_t *fb = esp_camera_fb_get();
+                    if (fb) {
+                        lcd_show_pic(0, 0, fb->width, fb->height, (uint8_t *)fb->buf);
+                        esp_camera_fb_return(fb);
+                    }
+                } else {
+                    // JPEG模式（RGB565恢复失败）：显示提示，等待拍照
+                    static bool jpeg_hint_shown = false;
+                    if (!jpeg_hint_shown) {
+                        lcd_clear(WHITE);
+                        lcd_show_string(30, 90,  200, 24, LCD_FONT_24, "Ready", RED);
+                        lcd_show_string(30, 130, 200, 16, LCD_FONT_16, "KEY1: Capture", BLUE);
+                        lcd_show_string(30, 155, 200, 16, LCD_FONT_16, "KEY0: Back",    BLUE);
+                        jpeg_hint_shown = true;
+                    }
+                    if (key0_pressed || key1_pressed) jpeg_hint_shown = false;
                 }
             }
             
@@ -451,7 +468,9 @@ void loop()
                 app_state = STATE_IDLE;
                 need_redraw_main = true;
             } else if (key1_pressed && wifi_connected) {
-                Serial.println(">>> KEY1拍照识别");
+                Serial.println(">>> KEY1拍照识别（从预览模式）");
+                // 先停止预览，等待一帧完成
+                delay(100);
                 app_state = STATE_CAPTURING;
                 capture_and_upload();
                 app_state = STATE_IDLE;
@@ -475,16 +494,18 @@ String base64_encode(uint8_t *data, size_t len);
 void capture_and_upload()
 {
     Serial.println("[拍照] 开始...");
-    lcd_clear(BLACK);
-    lcd_show_string(30, 100, 200, 16, LCD_FONT_16, "Capturing...", YELLOW);
+    lcd_clear(WHITE);
+    lcd_show_string(30, 100, 200, 16, LCD_FONT_16, "Capturing...", BLUE);
     
     bool jpeg_ok = false;
     String base64Img = "";
     
     // ---------------- 切换到JPEG格式 ----------------
     Serial.println("[拍照] 切换到JPEG格式...");
+    
+    // 先停止摄像头，等待当前帧完成
     esp_camera_deinit();
-    delay(100);
+    delay(300);  // 增加延迟，确保完全释放资源
     
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
@@ -513,12 +534,33 @@ void capture_and_upload()
     config.jpeg_quality = 10;
     config.fb_count = 1;
     
-    esp_err_t err = esp_camera_init(&config);
+    // 重试机制：最多尝试3次
+    esp_err_t err = ESP_FAIL;
+    int retry = 0;
+    while (err != ESP_OK && retry < 3) {
+        err = esp_camera_init(&config);
+        if (err != ESP_OK) {
+            retry++;
+            Serial.printf("[拍照] JPEG初始化失败，重试 %d/3, 错误: 0x%x\n", retry, err);
+            delay(500);
+        }
+    }
+    
     if (err != ESP_OK) {
         Serial.println("[拍照] JPEG初始化失败！");
         lcd_show_string(30, 120, 200, 16, LCD_FONT_16, "Camera Fail!", RED);
         delay(2000);
+        camera_in_jpeg_mode = false;
+        
+        // 尝试恢复RGB565模式
+        Serial.println("[拍照] 尝试恢复RGB565...");
+        config.frame_size = FRAMESIZE_QVGA;
+        config.pixel_format = PIXFORMAT_RGB565;
+        config.fb_count = 2;
+        esp_camera_init(&config);
+        return;  // 直接返回，不继续拍照
     } else {
+        camera_in_jpeg_mode = true;  // 标记为JPEG模式
         Serial.println("[拍照] JPEG初始化成功！");
         delay(200);
         
@@ -541,33 +583,41 @@ void capture_and_upload()
         }
     }
     
-    // ---------------- 恢复RGB565格式 ----------------
-    Serial.println("[拍照] 恢复RGB565格式...");
-    esp_camera_deinit();
-    delay(100);
-    
-    config.frame_size = FRAMESIZE_QVGA;
-    config.pixel_format = PIXFORMAT_RGB565;
-    config.jpeg_quality = 12;
-    config.fb_count = 2;
-    
-    err = esp_camera_init(&config);
-    if (err != ESP_OK) {
-        Serial.println("[拍照] RGB565恢复失败！");
-    } else {
-        Serial.println("[拍照] RGB565恢复成功！");
-    }
-    delay(100);
-    
     // 如果JPEG抓取成功，则上传
     if (jpeg_ok && base64Img.length() > 0) {
         send_to_server(base64Img);
         Serial.println("[拍照] 完成！");
         delay(1000);
     }
+
+    // ---------------- 上传播放完成后再恢复RGB565 ----------------
+    // 此时HTTP和音频内存已释放，DMA分配成功率最高
+    Serial.println("[拍照] 恢复RGB565格式...");
+    
+    // 如果当前是JPEG模式，先deinit
+    if (camera_in_jpeg_mode) {
+        esp_camera_deinit();
+        delay(300);
+    }
+
+    config.frame_size = FRAMESIZE_QVGA;
+    config.pixel_format = PIXFORMAT_RGB565;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.jpeg_quality = 12;
+    config.fb_count = 2;  // 恢复为2个缓冲区，提高预览流畅度
+
+    err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        Serial.printf("[拍照] RGB565恢复失败: 0x%x\n", err);
+        camera_in_jpeg_mode = true;  // 恢复失败，保持JPEG模式标记
+    } else {
+        Serial.println("[拍照] RGB565恢复成功！");
+        camera_in_jpeg_mode = false;  // 恢复成功，标记为RGB565模式
+    }
     
     // 恢复主界面和传感器显示
-    lcd_clear(BLACK);
+    lcd_clear(WHITE);
     xl9555_pin_set(SLCD_PWR, IO_SET_HIGH);
     lcd_show_string(30, 20, 200, 24, LCD_FONT_24, "Smart Guide", RED);
     lcd_show_string(30, 55, 200, 16, LCD_FONT_16, "KEY0: Preview", BLUE);
@@ -579,7 +629,7 @@ void capture_and_upload()
     }
     
     // 显示传感器状态
-    lcd_show_string(30, 145, 200, 16, LCD_FONT_16, "Sensors:", WHITE);
+    lcd_show_string(30, 145, 200, 16, LCD_FONT_16, "Sensors:", BLACK);
     if (dht11_ok) {
         lcd_show_string(30, 165, 200, 16, LCD_FONT_16, "DHT11: OK", GREEN);
     } else {
@@ -682,23 +732,34 @@ void send_to_server(String base64Img)
             Serial.println("介绍: " + description);
             Serial.println("语音: " + audioUrl);
             
+            // 清屏并显示内容（仅显示ASCII字符，因为LCD不支持中文）
             lcd_clear(WHITE);
-            lcd_show_string(10, 10, 220, 16, LCD_FONT_16, "Spot:", RED);
+            lcd_show_string(10, 10, 300, 16, LCD_FONT_16, "=== Spot Info ===", RED);
             
-            String displayName = spotName.length() > 14 ? spotName.substring(0, 14) : spotName;
-            lcd_show_string(10, 30, 220, 24, LCD_FONT_24, displayName.c_str(), BLUE);
-                
-            lcd_show_string(10, 70, 220, 16, LCD_FONT_16, "Info:", RED);
-            String shortDesc = description.length() > 60 ? description.substring(0, 60) : description;
-            lcd_show_string(10, 90, 220, 16, LCD_FONT_16, shortDesc.c_str(), BLACK);
-                
-            lcd_show_string(10, 200, 220, 16, LCD_FONT_16, "Audio ready!", GREEN);
+            // 显示提示信息
+            lcd_show_string(10, 40, 300, 16, LCD_FONT_16, "Spot Name:", BLUE);
+            lcd_show_string(10, 60, 300, 16, LCD_FONT_16, "(See Serial Monitor)", BLACK);
+            
+            lcd_show_string(10, 90, 300, 16, LCD_FONT_16, "Description:", BLUE);
+            lcd_show_string(10, 110, 300, 16, LCD_FONT_16, "(See Serial Monitor)", BLACK);
+            
+            // 显示统计信息
+            char info[64];
+            snprintf(info, sizeof(info), "Text Length: %d chars", description.length());
+            lcd_show_string(10, 140, 300, 16, LCD_FONT_16, info, BLACK);
+            
+            lcd_show_string(10, 170, 300, 16, LCD_FONT_16, "Audio Status:", BLUE);
                 
             if (audioUrl.length() > 0) {
                 Serial.println("开始播放语音讲解...");
-                lcd_show_string(10, 220, 220, 16, LCD_FONT_16, "Playing audio...", BLUE);
+                lcd_show_string(10, 190, 300, 16, LCD_FONT_16, "Playing audio...", GREEN);
+                
                 audio_play_network(audioUrl.c_str());
-                lcd_show_string(10, 220, 220, 16, LCD_FONT_16, "Audio done!", GREEN);
+                
+                lcd_show_string(10, 190, 300, 16, LCD_FONT_16, "Audio completed!", GREEN);
+                lcd_show_string(10, 210, 300, 16, LCD_FONT_16, "Press KEY0 to exit", BLUE);
+            } else {
+                lcd_show_string(10, 190, 300, 16, LCD_FONT_16, "No audio available", RED);
             }
         }
         else
@@ -756,4 +817,91 @@ String base64_encode(uint8_t *data, size_t len)
     }
     
     return result;
+}
+
+/* ============== 多行文本显示函数 ============== */
+
+/**
+ * @brief  显示多行文本（自动换行）
+ * @param  x: 起始X坐标
+ * @param  y: 起始Y坐标
+ * @param  max_width: 最大宽度（像素）
+ * @param  text: 要显示的文本
+ * @param  font: 字体大小
+ * @param  color: 文字颜色
+ * @note   支持中文自动换行，每行最多显示约18个中文字符（16号字体）
+ */
+void display_multiline_text(uint16_t x, uint16_t y, uint16_t max_width, const char* text, lcd_font_t font, uint16_t color)
+{
+    if (!text || strlen(text) == 0) {
+        Serial.println("[显示] 文本为空");
+        return;
+    }
+    
+    Serial.printf("[显示] 开始显示文本，长度: %d\n", strlen(text));
+    
+    // 根据字体大小确定行高和每行最大字节数
+    uint16_t line_height = 20;  // 16号字体行高
+    uint16_t max_bytes_per_line = 54;  // 每行最多54字节（约18个中文字符）
+    
+    if (font == LCD_FONT_24) {
+        line_height = 28;
+        max_bytes_per_line = 36;  // 约12个中文字符
+    } else if (font == LCD_FONT_12) {
+        line_height = 16;
+        max_bytes_per_line = 72;  // 约24个中文字符
+    }
+    
+    uint16_t current_y = y;
+    int text_len = strlen(text);
+    int pos = 0;
+    int line_count = 0;
+    
+    char line_buffer[128];
+    
+    while (pos < text_len && current_y < 210 && line_count < 6) {  // 最多6行
+        int buffer_pos = 0;
+        int line_bytes = 0;
+        
+        // 填充一行
+        while (pos < text_len && line_bytes < max_bytes_per_line) {
+            unsigned char c = text[pos];
+            
+            // UTF-8中文字符判断（3字节）
+            if ((c & 0xE0) == 0xE0) {
+                // 中文字符（3字节）
+                if (pos + 2 < text_len && line_bytes + 3 <= max_bytes_per_line) {
+                    line_buffer[buffer_pos++] = text[pos++];
+                    line_buffer[buffer_pos++] = text[pos++];
+                    line_buffer[buffer_pos++] = text[pos++];
+                    line_bytes += 3;
+                } else {
+                    break;  // 这行放不下了
+                }
+            } 
+            // 检查是否为换行符
+            else if (c == '\n' || c == '\r') {
+                pos++;
+                break;  // 强制换行
+            }
+            // ASCII字符
+            else {
+                line_buffer[buffer_pos++] = text[pos++];
+                line_bytes++;
+            }
+        }
+        
+        // 显示这一行
+        if (buffer_pos > 0) {
+            line_buffer[buffer_pos] = '\0';
+            Serial.printf("[显示] 第%d行: %s\n", line_count + 1, line_buffer);
+            lcd_show_string(x, current_y, max_width, line_height, font, line_buffer, color);
+            current_y += line_height;
+            line_count++;
+        } else {
+            break;  // 没有内容了
+        }
+    }
+    
+    Serial.printf("[显示] 完成，共显示%d行\n", line_count);
 }
